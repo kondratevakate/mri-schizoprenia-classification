@@ -168,3 +168,136 @@ class LA5_Siblings_MRI(data.Dataset):
 
     def __len__(self):
         return len(self.mri_paths)
+    
+def targets_complete(sample, 
+                     prefix=False, 
+                     mask_path=False,
+                     image_path='/gpfs/gpfs0/sbi/data/fcd_classification_bank',
+                     targets_path='../targets/targets_fcd_bank.csv', 
+                     ignore_missing=True, data_type = False):
+    """
+    Custom function to complete dataset composition in the local environement.
+    Walks through directories and completes fils list, according to targets.
+    
+    """
+    targets = pd.read_csv(targets_path)
+    files = pd.DataFrame(columns = ['patient','scan','fcd','img_file','img_seg'])
+    clause = (targets['sample'] == sample)
+        
+    if prefix:
+        clause = (targets['sample'] == sample)&(targets['patient'].str.startswith(prefix))
+     
+    files['patient']= targets['patient'][clause].copy()
+    files['fcd'] = targets['fcd'][clause].copy()
+    files['scan'] = targets['scan'][clause].copy()
+    files['detection'] = targets['detection'][clause].copy()
+    files['comments'] = targets['comments'][clause].copy()
+    
+    if mask_path:
+        files['img_mask'] = ''
+        
+    elif sample == 'all':
+        files['patient']= targets['patient'].copy()
+        files['fcd'] = targets['fcd'].copy()
+        files['scan'] = targets['scan'].copy()   
+        files['detection'] = targets['detection'].copy()
+        files['comments'] = targets['comments'].copy()
+                
+    for i in tqdm(range(len(files))):
+        for file_in_folder in glob.glob(os.path.join(image_path,'*norm*')):
+                if sample == 'pirogov':
+                    if ((files['patient'].iloc[i] +'_norm.nii.gz') == file_in_folder.split('/')[-1]):
+                        files['img_file'].iloc[i] = file_in_folder
+                else:
+                    if (files['patient'].iloc[i] in file_in_folder):
+                        files['img_file'].iloc[i] = file_in_folder
+        
+        for file_in_folder in glob.glob(os.path.join(image_path,'*aseg*')):
+                if sample == 'pirogov':
+#                     print((files['patient'].iloc[i] +'_aparc+aseg.nii.gz'), file_in_folder.split('/')[-1])
+                    if ((files['patient'].iloc[i] +'_aparc+aseg.nii.gz') == file_in_folder.split('/')[-1]) or\
+    ((files['patient'].iloc[i] +'_aparc+aseg.nii') == file_in_folder.split('/')[-1]):
+                        files['img_seg'].iloc[i] = file_in_folder 
+                else:    
+                    if (files['patient'].iloc[i] in file_in_folder):
+                        files['img_seg'].iloc[i] = file_in_folder       
+        if mask_path:
+            for file_in_folder in glob.glob(os.path.join(mask_path,'*.nii*')):
+                if ((files['patient'].iloc[i] +'.nii.gz') == file_in_folder.split('/')[-1]):
+                    files['img_mask'].iloc[i] = file_in_folder
+        
+    # treating missing objects
+    if ignore_missing:
+        # if only 'img' is needed for classification
+        if data_type =='img':
+            files.dropna(subset = ['img_file'], inplace= True)
+         # if only 'seg' is needed for classification
+        elif data_type =='seg':
+            files.dropna(subset = ['img_seg'], inplace= True)
+        # saving only full pairs of data    
+        else: 
+            files.dropna(subset = ['img_seg','img_file'], inplace= True)
+        
+    # reindexing an array
+    files = files.reset_index(drop=True)
+    le = LabelEncoder() 
+    files['scan'] = le.fit_transform(files['scan'])
+    
+    return files, le
+
+    
+class MriClassification(data.Dataset):
+    """
+    Arguments:
+        image_path (str): paths to data folders 
+        prefix (str): patient name prefix (optional)
+        sample (str): subset of the data, 'all' for whole sample
+        targets_path (str): targets file path
+        if ignore_missing (bool): delete subject if the data partially missing
+        data_type (str): ['img', 'seg'] 
+                         'img' - for T1 normalised image
+                         'seg' - for image Freesurfer aseg+aparc.nii.gz 
+    """
+    def __init__(self, sample, prefix=False, mask_path=False,
+                 image_path='/gpfs/gpfs0/sbi/data/fcd_classification_bank',
+                 targets_path='../targets/targets_fcd_bank.csv', ignore_missing=True,
+                 coord_min=(30,30,30,), img_shape=(192, 192, 192,),
+                 data_type ='seg'):
+        
+        super(MriClassification, self).__init__()
+        print('Assembling data for: ', sample, ' sample.')
+
+        files,le = targets_complete(sample, prefix, mask_path, image_path,
+                                 targets_path, ignore_missing, data_type)
+        
+        self.img_files = files['img_file']
+        self.img_seg = files['img_seg']
+        self.scan = files['scan']
+        self.scan_keys = le.classes_
+        self.target = files['fcd'] 
+        self.detection = files['detection']
+        self.misc = files['comments']
+           
+        self.coord_min = coord_min
+        self.img_shape = img_shape
+        self.data_type = data_type
+        
+        assert data_type in ['seg','img'], "Invalid file format!"
+            
+    def __getitem__(self, index):
+            img_path = self.img_files[index]
+            img_array = load_nii_to_array(img_path)                       
+            img = reshape_image(img_array, self.coord_min, self.img_shape)
+            
+            if self.data_type == 'img':
+                return torch.from_numpy(img).float(), self.target[index], self.scan[index]
+            
+            elif self.data_type == 'seg':
+                # not binarising cortical structures
+                seg_path = self.img_seg[index]
+                seg_array = load_nii_to_array(seg_path)
+                seg = reshape_image(seg_array, self.coord_min, self.img_shape)
+                return torch.from_numpy(seg).float(), self.target[index], self.scan[index]
+
+    def __len__(self):
+        return len(self.img_files)

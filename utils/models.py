@@ -102,7 +102,7 @@ class VoxResNet(nn.Module):
 
 
 class CNN(nn.Module):
-    def __init__(self, input_shape=(64, 76, 48), n_filters=16, n_blocks=3, stride=1, n_fc_units=128):
+    def __init__(self, num_classes = 2, input_shape=(64, 76, 48), n_filters=16, n_blocks=3, stride=1, n_fc_units=128):
         super(self.__class__, self).__init__()
         self.model = nn.Sequential()
 
@@ -168,6 +168,7 @@ class CNN(nn.Module):
 
         self.model.add_module("batch_norm_9", nn.BatchNorm1d(n_fc_units))
         self.model.add_module("activation_9", nn.ReLU(inplace=True))
+        self.model.add_module("fully_conn_2", nn.Linear(n_fc_units, num_classes))
 
     #         self.model.add_module("dropout_1", nn.Dropout(dropout))
 
