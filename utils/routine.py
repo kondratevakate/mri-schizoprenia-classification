@@ -1,4 +1,5 @@
 import time
+import copy
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -9,6 +10,80 @@ from IPython.display import clear_output
 from scipy import stats
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
+
+
+class ResNetGrad(torch.nn.Module):
+    def __init__(self, model):
+        super(ResNetGrad, self).__init__()
+        self.features = model.model[:-5]
+        self.classifier = model.model[-5:]
+        self.gradients = None
+
+    def activations_hook(self, grad):
+        self.gradients = grad
+
+    def forward(self, x):
+        x = self.features(x)
+        h = x.register_hook(self.activations_hook)
+        x = self.classifier(x)
+        return x
+
+    def get_activations_gradient(self):
+        return self.gradients
+
+    def get_activations(self, x):
+        return self.features(x)
+
+class GuidedBackprop():
+    def __init__(self, model):
+        self.model = model
+
+    def guided_backprop(self, input, label):
+
+        def hookfunc(module, gradInput, gradOutput):
+            return tuple([(None if g is None else g.clamp(min=0)) for g in gradInput])
+
+        input.requires_grad = True
+        h = [0] * len(list(self.model.features) + list(self.model.classifier))
+        for i, module in enumerate(list(self.model.features) + list(self.model.classifier)):
+            if type(module) == torch.nn.ReLU:
+                h[i] = module.register_backward_hook(hookfunc)
+
+        self.model.eval()
+        output = self.model(input)
+        self.model.zero_grad()
+        output[0][label].backward()
+        grad = input.grad.data
+        grad /= grad.max()
+        return np.clip(grad.cpu().numpy(),0,1)
+
+
+def get_masks(mod, image, mask_type='grad_cam', cl=0):
+    model = copy.deepcopy(mod)
+    model.eval()
+    masks = []
+    image = torch.tensor(image).unsqueeze(1).to(device)
+    logit = model(image)
+
+    if mask_type == 'grad_cam':
+        logit[:,cl].backward()
+        activation = model.get_activations(image).detach()
+        act_grad  = model.get_activations_gradient()
+        pool_act_grad = torch.mean(act_grad, dim=[2,3,4], keepdim=True)
+        activation = activation * pool_act_grad
+        heatmap = torch.sum(activation, dim=1)
+        heatmap = F.relu(heatmap)
+        heatmap /= torch.max(heatmap)
+        heatmap = F.interpolate(heatmap.unsqueeze(0),(153, 189, 163), mode='trilinear', align_corners=False)
+        masks.append(heatmap.cpu().numpy())
+
+    elif mask_type == 'guided_backprop':
+        gp = GuidedBackprop(model)
+        pred = logit.data.max(1)[1].item()
+        img_grad = gp.guided_backprop(image, pred)
+        masks.append(img_grad)
+
+    return np.concatenate(masks,axis=0).squeeze(axis=1)
 
 
 def run_one_epoch(model, loader, criterion, train, device, optimizer=None):
@@ -40,7 +115,7 @@ def train(
     model, optimizer, train_dataloader, val_dataloader, device,
     metric, verbose=0, model_save_path=None,
         max_epoch=10, eps=3e-3, max_patience=10):
-    
+
     criterion = nn.CrossEntropyLoss()
 
     patience = 0
@@ -76,8 +151,8 @@ def train(
                 print("  validation loss: \t\t\t{:.6f}".format(epoch_val_loss[-1]))
             print("  training {}: \t\t\t{:.2f}".format(metric.__name__, epoch_train_metric[-1]))
             if val_dataloader is not None:
-                print("  validation {}: \t\t\t{:.2f}".format(metric.__name__, epoch_val_metric[-1]))    
-            
+                print("  validation {}: \t\t\t{:.2f}".format(metric.__name__, epoch_val_metric[-1]))
+
         # 5. Plot metrics
         if verbose:
             fig, axes = plt.subplots(1, 2, figsize=(10, 5))
@@ -96,7 +171,7 @@ def train(
             axes[1].set_ylabel(metric.__name__)
             axes[1].legend()
             plt.show()
-        
+
         # 5. Early stopping, best metrics, save model
         if val_dataloader is not None and epoch_val_metric[-1] > best_metric:
             patience = 0
@@ -148,7 +223,7 @@ def stratified_batch_indices(indices, labels):
 
 def cross_val_score(
         create_model_opt, train_dataset, cv, device, metric, model_load_path=None,
-        batch_size=10, val_dataset=None, transfer=False, finetune=False):
+        batch_size=10, val_dataset=None, transfer=False, finetune=False, inter_method=None, masks_path=None):
     assert not (transfer and finetune)
     assert (transfer == False) or (transfer == True and model_load_path is not None)
 
@@ -176,10 +251,12 @@ def cross_val_score(
             val_mask = (np.isin(val_dataset.pids, train_dataset.pids[train_idx]) == False)
             val_idx = np.arange(len(val_dataset))[val_mask]
             del val_mask
-        val_loader = DataLoader(Subset(val_dataset, val_idx),
+
+        val_dataset_cv = Subset(val_dataset, val_idx),
                                 shuffle=False,
                                 batch_size=batch_size,
-                                drop_last=False)
+                                drop_last=False
+        val_loader = DataLoader(val_dataset_cv)
 
         if model_load_path is None or transfer or finetune:  # train + validation
             if model_load_path is None:  # train from scratch
@@ -193,6 +270,7 @@ def cross_val_score(
                                              metric=metric, verbose=1, eps=eps)
             val_metrics.append(last_val_metric)
             del train_loader
+
         else:  # no train, just validation
             model, optimizer = create_model_opt(model_load_path, transfer=False)
             criterion = nn.CrossEntropyLoss()
@@ -200,7 +278,13 @@ def cross_val_score(
                 val_losses, val_probs, val_targets = run_one_epoch(model, val_loader, criterion, False, device)
             val_metric = metric(val_targets, val_probs)
             val_metrics.append(val_metric)
-            
+
+            if inter_method is not None:
+                for img_number in range(len(val_dataset_cv)):
+                    masks = get_masks(model.to(device), val_dataset_cv[img_number][0], inter_method)
+                    nib.save(nib.Nifti1Image(masks[0], affine=np.diag(np.ones(4)), header=nib.Nifti1Header()), masks_path + '/' + str(i) + '_' + str(img_number) + '.nii')
+
+
         del val_loader, model, optimizer
 
     return val_metrics
